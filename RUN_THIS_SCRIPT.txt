@@ -1,0 +1,9 @@
+Congressional Data MCP Server - Setup Instructions
+================================================
+
+1. Save this Python script as: build_project.py
+2. Run it: python build_project.py
+3. It will create a congressional-data-mcp.zip file
+4. Extract the ZIP and follow the setup instructions
+
+The script creates all project files automatically!

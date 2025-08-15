@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: enactai-data-mcp
+    runtime: docker
+    dockerfilePath: ./Dockerfile.remote
+    dockerContext: ../
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: CONGRESS_GOV_API_KEY
+        sync: false
+      - key: GOVINFO_API_KEY
+        sync: false
+      - key: ENACTAI_API_TOKEN
+        generateValue: true
+      - key: PORT
+        value: 8080

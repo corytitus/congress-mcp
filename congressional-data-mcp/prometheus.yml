@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'congressional-mcp'
+
+scrape_configs:
+  - job_name: 'congressional-mcp'
+    static_configs:
+      - targets: ['congressional-mcp:8080']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+    
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+    
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

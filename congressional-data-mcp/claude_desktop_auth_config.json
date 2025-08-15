@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "enactai-data-auth": {
+      "command": "/Users/corytitus/Documents/GitHub/congress-mcp/congressional-data-mcp/run_auth.sh",
+      "args": [],
+      "env": {
+        "REQUIRE_AUTH": "true"
+      }
+    }
+  }
+}

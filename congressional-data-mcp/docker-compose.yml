@@ -1,0 +1,108 @@
+version: '3.8'
+
+services:
+  congressional-mcp:
+    build: .
+    image: congressional-data-mcp:latest
+    container_name: congressional-data-mcp
+    restart: unless-stopped
+    
+    environment:
+      # API Keys - Set these in your .env file
+      - CONGRESS_GOV_API_KEY=${CONGRESS_GOV_API_KEY}
+      - GOVINFO_API_KEY=${GOVINFO_API_KEY}
+      
+      # MCP Configuration
+      - MCP_SERVER_NAME=congressional-data-mcp
+      - MCP_LOG_LEVEL=${MCP_LOG_LEVEL:-INFO}
+      - DOCKER_MODE=true
+      
+      # Cache Configuration
+      - CACHE_TTL=${CACHE_TTL:-3600}
+      - CACHE_SIZE=${CACHE_SIZE:-1000}
+      
+      # Rate Limiting
+      - RATE_LIMIT_CONGRESS=${RATE_LIMIT_CONGRESS:-100}
+      - RATE_LIMIT_GOVINFO=${RATE_LIMIT_GOVINFO:-100}
+      
+    volumes:
+      # Configuration files
+      - ./config:/app/config:ro
+      - ./.env:/app/.env:ro
+      
+      # Logs
+      - ./logs:/app/logs
+      
+      # Cache persistence
+      - cache_data:/app/cache
+      
+    ports:
+      # Optional HTTP interface for health checks
+      - "8081:8080"
+      
+    networks:
+      - mcp-network
+      
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+      
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+        
+  # Optional Redis cache for better performance
+  redis:
+    image: redis:7-alpine
+    container_name: congressional-mcp-redis
+    restart: unless-stopped
+    
+    volumes:
+      - redis_data:/data
+      
+    networks:
+      - mcp-network
+      
+    command: redis-server --appendonly yes
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Optional monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: congressional-mcp-prometheus
+    restart: unless-stopped
+    
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+      
+    ports:
+      - "9090:9090"
+      
+    networks:
+      - mcp-network
+      
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+
+volumes:
+  cache_data:
+  redis_data:
+  prometheus_data:
+
+networks:
+  mcp-network:
+    driver: bridge

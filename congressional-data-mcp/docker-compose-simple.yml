@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  congressional-mcp:
+    build: .
+    image: congressional-data-mcp:latest
+    container_name: congressional-data-mcp
+    restart: unless-stopped
+    
+    environment:
+      - CONGRESS_GOV_API_KEY=${CONGRESS_GOV_API_KEY}
+      - GOVINFO_API_KEY=${GOVINFO_API_KEY}
+      - MCP_SERVER_NAME=congressional-data-mcp
+      - MCP_LOG_LEVEL=INFO
+      - ENABLE_CACHING=true
+      - CACHE_TTL=3600
+      - RATE_LIMIT_CONGRESS=100
+      - RATE_LIMIT_GOVINFO=100
+      
+    volumes:
+      - ./.env:/app/.env:ro
+      - ./logs:/app/logs
+      
+    ports:
+      - "8080:8080"
+      
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s

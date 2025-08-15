@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "congressional-data": {
+      "command": "docker",
+      "args": [
+        "run",
+        "--rm",
+        "-i",
+        "--env-file", ".env",
+        "--network", "congressional-data-mcp_mcp-network",
+        "congressional-data-mcp:latest",
+        "python",
+        "server.py"
+      ]
+    }
+  }
+}
