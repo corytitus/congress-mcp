@@ -121,7 +121,8 @@ def check_permission(token_info: Dict, tool_name: str) -> bool:
     # Read-only tools
     read_only_tools = [
         'search_bills', 'get_bill', 'get_member', 'get_committee',
-        'get_congress_overview', 'get_legislative_process', 'search_amendments'
+        'get_congress_overview', 'get_legislative_process', 'search_amendments',
+        'get_related_bills'
     ]
     
     # Standard includes read + some write operations
@@ -181,6 +182,21 @@ async def handle_list_tools() -> list[types.Tool]:
                     "congress": {"type": "integer", "description": "Congress number"},
                     "bill_type": {"type": "string", "description": "Bill type (hr, s, hjres, sjres)"},
                     "bill_number": {"type": "integer", "description": "Bill number"}
+                },
+                "required": ["congress", "bill_type", "bill_number"]
+            }
+        ),
+        types.Tool(
+            name="get_related_bills",
+            description="Get bills related to a specific bill (similar bills, procedurally-related bills, etc.)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    **token_param,
+                    "congress": {"type": "integer", "description": "Congress number"},
+                    "bill_type": {"type": "string", "description": "Bill type (hr, s, hjres, sjres, hres, sres, hconres, sconres)"},
+                    "bill_number": {"type": "integer", "description": "Bill number"},
+                    "limit": {"type": "integer", "description": "Maximum number of related bills to return (default 20)"}
                 },
                 "required": ["congress", "bill_type", "bill_number"]
             }
@@ -385,6 +401,55 @@ async def handle_call_tool(
             result = {
                 "bill": data.get("bill", {}),
                 "source": format_source("congress", f"{bill_type.upper()} {bill_number} ({congress}th Congress)")
+            }
+            
+        elif name == "get_related_bills":
+            congress = args_without_token["congress"]
+            bill_type = args_without_token["bill_type"]
+            bill_number = args_without_token["bill_number"]
+            limit = args_without_token.get("limit", 20)
+            
+            url = f"https://api.congress.gov/v3/bill/{congress}/{bill_type}/{bill_number}/relatedbills"
+            params = {"format": "json", "limit": limit}
+            headers = {"X-Api-Key": CONGRESS_API_KEY} if CONGRESS_API_KEY else {}
+            
+            response = await client.get(url, params=params, headers=headers)
+            data = response.json()
+            
+            # Process related bills data
+            related_bills = data.get("relatedBills", [])
+            
+            # Format the related bills for better readability
+            formatted_bills = []
+            for bill in related_bills:
+                formatted_bill = {
+                    "congress": bill.get("congress"),
+                    "type": bill.get("type"),
+                    "number": bill.get("number"),
+                    "title": bill.get("title"),
+                    "latestAction": bill.get("latestAction", {}),
+                    "relationships": []
+                }
+                
+                # Extract relationship details
+                for relationship in bill.get("relationshipDetails", []):
+                    formatted_bill["relationships"].append({
+                        "type": relationship.get("type"),
+                        "identifiedBy": relationship.get("identifiedBy")
+                    })
+                
+                formatted_bills.append(formatted_bill)
+            
+            result = {
+                "originalBill": {
+                    "congress": congress,
+                    "type": bill_type.upper(),
+                    "number": bill_number,
+                    "identifier": f"{bill_type.upper()} {bill_number} ({congress}th Congress)"
+                },
+                "relatedBills": formatted_bills,
+                "count": data.get("pagination", {}).get("count", len(related_bills)),
+                "source": format_source("congress", f"Related bills for {bill_type.upper()} {bill_number} ({congress}th Congress)")
             }
             
         elif name == "get_member":

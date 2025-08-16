@@ -8,6 +8,7 @@ import os
 import json
 import asyncio
 import httpx
+import base64
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, List
 from collections import defaultdict
@@ -25,6 +26,9 @@ from mcp.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
 import mcp.server.sse as sse
 import mcp.types as types
+
+# Import document store
+from document_store import DocumentStore, load_default_documents
 
 # Configuration
 CONGRESS_API_KEY = os.getenv("CONGRESS_GOV_API_KEY", "")
@@ -49,6 +53,9 @@ mcp_server = Server("enactai-data")
 
 # HTTP client for external APIs
 client = httpx.AsyncClient(timeout=30.0)
+
+# Initialize document store
+document_store = DocumentStore()
 
 # Cache for API responses (TTL: 5 minutes)
 cache: Dict[str, tuple[Any, datetime]] = {}
@@ -258,6 +265,72 @@ async def handle_list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "congress": {"type": "integer", "description": "Congress number (default: current 118)"}
+                }
+            }
+        ),
+        types.Tool(
+            name="get_related_bills",
+            description="Find bills related to a specific bill (similar bills, procedurally-related bills, etc.)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "congress": {"type": "integer", "description": "Congress number"},
+                    "bill_type": {"type": "string", "description": "Bill type (hr, s, hjres, sjres)"},
+                    "bill_number": {"type": "integer", "description": "Bill number"},
+                    "limit": {"type": "integer", "description": "Maximum results (default 20)"}
+                },
+                "required": ["congress", "bill_type", "bill_number"]
+            }
+        ),
+        types.Tool(
+            name="store_document",
+            description="Store a document with metadata for later retrieval",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "Document content (text or base64-encoded binary)"},
+                    "filename": {"type": "string", "description": "Original filename"},
+                    "title": {"type": "string", "description": "Document title"},
+                    "description": {"type": "string", "description": "Document description"},
+                    "category": {"type": "string", "description": "Category (e.g., 'legislative_process', 'rules', 'guides')"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags for searching"},
+                    "is_binary": {"type": "boolean", "description": "Whether content is base64-encoded binary", "default": False}
+                },
+                "required": ["content", "filename"]
+            }
+        ),
+        types.Tool(
+            name="search_documents",
+            description="Search for stored documents by query, category, or tags",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query text"},
+                    "category": {"type": "string", "description": "Filter by category"},
+                    "tags": {"type": "array", "items": {"type": "string"}, "description": "Filter by tags"}
+                }
+            }
+        ),
+        types.Tool(
+            name="get_document",
+            description="Retrieve a specific document by ID",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "doc_id": {"type": "string", "description": "Document ID"},
+                    "include_content": {"type": "boolean", "description": "Include full document content", "default": False}
+                },
+                "required": ["doc_id"]
+            }
+        ),
+        types.Tool(
+            name="list_documents",
+            description="List all stored documents with basic metadata",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "description": "Filter by category"},
+                    "limit": {"type": "integer", "description": "Maximum results", "default": 50}
                 }
             }
         )
@@ -490,6 +563,205 @@ async def execute_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 text=f"Error tracking bill progress: {str(e)}"
             )]
     
+    elif name == "get_related_bills":
+        try:
+            congress = arguments["congress"]
+            bill_type = arguments["bill_type"]
+            bill_number = arguments["bill_number"]
+            limit = arguments.get("limit", 20)
+            
+            url = f"https://api.congress.gov/v3/bill/{congress}/{bill_type}/{bill_number}/relatedbills"
+            headers = {"X-Api-Key": CONGRESS_API_KEY}
+            params = {"format": "json", "limit": limit}
+            
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            related_bills = data.get("relatedBills", [])
+            
+            # Format the related bills for better readability
+            formatted_bills = []
+            for bill in related_bills:
+                formatted_bill = {
+                    "congress": bill.get("congress"),
+                    "type": bill.get("type"),
+                    "number": bill.get("number"),
+                    "title": bill.get("title"),
+                    "latestAction": bill.get("latestAction", {}),
+                    "relationships": []
+                }
+                
+                # Extract relationship details
+                for relationship in bill.get("relationshipDetails", []):
+                    formatted_bill["relationships"].append({
+                        "type": relationship.get("type"),
+                        "identifiedBy": relationship.get("identifiedBy")
+                    })
+                
+                formatted_bills.append(formatted_bill)
+            
+            result = {
+                "originalBill": {
+                    "congress": congress,
+                    "type": bill_type.upper(),
+                    "number": bill_number,
+                    "identifier": f"{bill_type.upper()} {bill_number} ({congress}th Congress)"
+                },
+                "relatedBills": formatted_bills,
+                "count": data.get("pagination", {}).get("count", len(related_bills)),
+                "source": format_source("congress", f"Related bills for {bill_type.upper()} {bill_number} ({congress}th Congress)")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(result, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error fetching related bills: {str(e)}"
+            )]
+    
+    elif name == "store_document":
+        try:
+            content = arguments["content"]
+            filename = arguments["filename"]
+            is_binary = arguments.get("is_binary", False)
+            
+            # Decode content if binary
+            if is_binary:
+                content_bytes = base64.b64decode(content)
+            else:
+                content_bytes = content.encode('utf-8')
+            
+            # Store the document
+            doc_id = document_store.store_document(
+                content=content_bytes,
+                filename=filename,
+                title=arguments.get("title"),
+                description=arguments.get("description"),
+                category=arguments.get("category"),
+                tags=arguments.get("tags"),
+                metadata=arguments.get("metadata")
+            )
+            
+            result = {
+                "status": "success",
+                "doc_id": doc_id,
+                "message": f"Document '{filename}' stored successfully",
+                "source": format_source("calculation", "Document Storage")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(result, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error storing document: {str(e)}"
+            )]
+    
+    elif name == "search_documents":
+        try:
+            results = document_store.search_documents(
+                query=arguments.get("query"),
+                category=arguments.get("category"),
+                tags=arguments.get("tags")
+            )
+            
+            response_data = {
+                "results": results,
+                "count": len(results),
+                "source": format_source("calculation", "Document Search")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(response_data, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error searching documents: {str(e)}"
+            )]
+    
+    elif name == "get_document":
+        try:
+            doc_id = arguments["doc_id"]
+            include_content = arguments.get("include_content", False)
+            
+            doc = document_store.get_document(doc_id)
+            if not doc:
+                return [types.TextContent(
+                    type="text",
+                    text=json.dumps({
+                        "error": "Document not found",
+                        "doc_id": doc_id
+                    }, indent=2)
+                )]
+            
+            # Include content if requested
+            if include_content:
+                content_bytes = document_store.get_document_content(doc_id)
+                if content_bytes:
+                    # Try to decode as text, otherwise encode as base64
+                    try:
+                        doc["content"] = content_bytes.decode('utf-8')
+                        doc["content_encoding"] = "text"
+                    except:
+                        doc["content"] = base64.b64encode(content_bytes).decode('ascii')
+                        doc["content_encoding"] = "base64"
+            
+            doc["source"] = format_source("calculation", "Document Storage")
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(doc, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error retrieving document: {str(e)}"
+            )]
+    
+    elif name == "list_documents":
+        try:
+            category = arguments.get("category")
+            limit = arguments.get("limit", 50)
+            
+            # Search with optional category filter
+            results = document_store.search_documents(category=category)
+            
+            # Limit results
+            results = results[:limit]
+            
+            # Get categories list
+            categories = document_store.list_categories()
+            
+            response_data = {
+                "documents": results,
+                "count": len(results),
+                "categories": categories,
+                "source": format_source("calculation", "Document Storage")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(response_data, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error listing documents: {str(e)}"
+            )]
+    
     elif name == "get_legislative_process":
         topics = {
             "overview": {
@@ -607,7 +879,437 @@ async def execute_tool(name: str, arguments: dict) -> list[types.TextContent]:
                 text=f"Error getting congress overview: {str(e)}"
             )]
     
-    # Add handlers for other tools following similar patterns...
+    elif name == "get_member":
+        try:
+            bioguide_id = arguments["bioguide_id"]
+            
+            url = f"https://api.congress.gov/v3/member/{bioguide_id}"
+            headers = {"X-Api-Key": CONGRESS_API_KEY}
+            params = {"format": "json"}
+            
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            member = data.get("member", {})
+            
+            result = {
+                "bioguide_id": bioguide_id,
+                "name": member.get("directOrderName"),
+                "state": member.get("state"),
+                "party": member.get("partyName"),
+                "chamber": "Senate" if member.get("terms", [{}])[-1].get("chamber") == "Senate" else "House",
+                "district": member.get("district"),
+                "terms": member.get("terms", []),
+                "current_role": member.get("terms", [{}])[-1] if member.get("terms") else {},
+                "depiction": member.get("depiction", {}).get("imageUrl"),
+                "source": format_source("congress", f"Member {bioguide_id}")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(result, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error fetching member: {str(e)}"
+            )]
+    
+    elif name == "search_members":
+        try:
+            state = arguments.get("state")
+            party = arguments.get("party")
+            chamber = arguments.get("chamber")
+            current_only = arguments.get("current_only", True)
+            
+            # Build URL based on chamber
+            if chamber == "house":
+                url = "https://api.congress.gov/v3/member/house"
+            elif chamber == "senate":
+                url = "https://api.congress.gov/v3/member/senate"
+            else:
+                url = "https://api.congress.gov/v3/member"
+            
+            if state:
+                url += f"/{state}"
+            
+            if current_only:
+                url += "/current"
+            
+            headers = {"X-Api-Key": CONGRESS_API_KEY}
+            params = {"format": "json", "limit": 250}
+            
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            members = data.get("members", [])
+            
+            # Filter by party if specified
+            if party:
+                members = [m for m in members if m.get("partyName", "")[0] == party]
+            
+            results = []
+            for member in members:
+                results.append({
+                    "bioguide_id": member.get("bioguideId"),
+                    "name": member.get("name"),
+                    "state": member.get("state"),
+                    "party": member.get("partyName"),
+                    "district": member.get("district"),
+                    "url": member.get("url")
+                })
+            
+            response_data = {
+                "results": results,
+                "count": len(results),
+                "source": format_source("congress", "Member Search")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(response_data, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error searching members: {str(e)}"
+            )]
+    
+    elif name == "get_committee":
+        try:
+            chamber = arguments["chamber"]
+            committee_code = arguments["committee_code"]
+            
+            url = f"https://api.congress.gov/v3/committee/{chamber}/{committee_code}"
+            headers = {"X-Api-Key": CONGRESS_API_KEY}
+            params = {"format": "json"}
+            
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            committee = data.get("committee", {})
+            
+            result = {
+                "committee_code": committee_code,
+                "name": committee.get("name"),
+                "chamber": committee.get("chamber"),
+                "type": committee.get("type"),
+                "jurisdiction": committee.get("jurisdiction"),
+                "url": committee.get("url"),
+                "subcommittees": committee.get("subcommittees", {}).get("item", []),
+                "source": format_source("congress", f"Committee {committee_code}")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(result, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error fetching committee: {str(e)}"
+            )]
+    
+    elif name == "get_vote":
+        try:
+            congress = arguments["congress"]
+            chamber = arguments["chamber"]
+            session = arguments["session"]
+            roll_call = arguments["roll_call"]
+            
+            url = f"https://api.congress.gov/v3/{chamber}/vote/{congress}/{session}/{roll_call}"
+            headers = {"X-Api-Key": CONGRESS_API_KEY}
+            params = {"format": "json"}
+            
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            vote = data.get("vote", {})
+            
+            result = {
+                "congress": congress,
+                "chamber": chamber,
+                "session": session,
+                "roll_call": roll_call,
+                "date": vote.get("date"),
+                "question": vote.get("question"),
+                "result": vote.get("result"),
+                "vote_type": vote.get("voteType"),
+                "required": vote.get("required"),
+                "counts": vote.get("counts"),
+                "bill": vote.get("bill") if vote.get("bill") else None,
+                "source": format_source("congress", f"Vote {chamber}/{congress}/{session}/{roll_call}")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(result, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error fetching vote: {str(e)}"
+            )]
+    
+    elif name == "search_govinfo":
+        try:
+            query = arguments["query"]
+            collection = arguments.get("collection")
+            date_from = arguments.get("date_from")
+            date_to = arguments.get("date_to")
+            limit = arguments.get("limit", 20)
+            
+            url = "https://api.govinfo.gov/search"
+            headers = {"X-Api-Key": GOVINFO_API_KEY if GOVINFO_API_KEY else ""}
+            
+            params = {
+                "query": query,
+                "pageSize": limit,
+                "offsetMark": "*"
+            }
+            
+            if collection:
+                params["collection"] = collection
+            if date_from:
+                params["publishedDateFrom"] = date_from
+            if date_to:
+                params["publishedDateTo"] = date_to
+            
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            results = []
+            
+            for doc in data.get("results", []):
+                results.append({
+                    "title": doc.get("title"),
+                    "packageId": doc.get("packageId"),
+                    "lastModified": doc.get("lastModified"),
+                    "packageLink": doc.get("packageLink"),
+                    "docClass": doc.get("docClass"),
+                    "congress": doc.get("congress")
+                })
+            
+            response_data = {
+                "results": results,
+                "count": data.get("count", len(results)),
+                "source": format_source("govinfo", "GovInfo Search")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(response_data, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error searching GovInfo: {str(e)}"
+            )]
+    
+    elif name == "get_public_law":
+        try:
+            congress = arguments["congress"]
+            law_number = arguments["law_number"]
+            
+            # Format: PLAW-{congress}publ{law_number}
+            package_id = f"PLAW-{congress}publ{law_number}"
+            
+            url = f"https://api.govinfo.gov/packages/{package_id}/summary"
+            headers = {"X-Api-Key": GOVINFO_API_KEY if GOVINFO_API_KEY else ""}
+            
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            result = {
+                "congress": congress,
+                "law_number": law_number,
+                "title": data.get("title"),
+                "packageId": data.get("packageId"),
+                "dateIssued": data.get("dateIssued"),
+                "detailsLink": data.get("detailsLink"),
+                "related_bills": data.get("references", {}).get("billNumber", []),
+                "source": format_source("govinfo", f"Public Law {congress}-{law_number}")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(result, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error fetching public law: {str(e)}"
+            )]
+    
+    elif name == "get_congressional_record":
+        try:
+            date = arguments["date"]
+            section = arguments.get("section")
+            keywords = arguments.get("keywords")
+            
+            # Format date for API (YYYY-MM-DD)
+            url = "https://api.govinfo.gov/search"
+            headers = {"X-Api-Key": GOVINFO_API_KEY if GOVINFO_API_KEY else ""}
+            
+            query = f"collection:CREC AND publishdate:{date}"
+            if section:
+                query += f" AND section:{section}"
+            if keywords:
+                query += f" AND {keywords}"
+            
+            params = {
+                "query": query,
+                "pageSize": 50,
+                "offsetMark": "*"
+            }
+            
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            results = []
+            
+            for doc in data.get("results", []):
+                results.append({
+                    "title": doc.get("title"),
+                    "packageId": doc.get("packageId"),
+                    "granuleId": doc.get("granuleId"),
+                    "section": doc.get("section"),
+                    "speaker": doc.get("speaker"),
+                    "detailsLink": doc.get("detailsLink")
+                })
+            
+            response_data = {
+                "date": date,
+                "results": results,
+                "count": len(results),
+                "source": format_source("govinfo", f"Congressional Record {date}")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(response_data, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error fetching Congressional Record: {str(e)}"
+            )]
+    
+    elif name == "get_member_votes":
+        try:
+            bioguide_id = arguments["bioguide_id"]
+            congress = arguments.get("congress", 118)
+            limit = arguments.get("limit", 50)
+            
+            # Get member's voting positions
+            url = f"https://api.congress.gov/v3/member/{bioguide_id}/voting-record"
+            headers = {"X-Api-Key": CONGRESS_API_KEY}
+            params = {
+                "format": "json",
+                "limit": limit
+            }
+            
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            votes = data.get("votes", [])
+            
+            results = []
+            for vote in votes:
+                results.append({
+                    "congress": vote.get("congress"),
+                    "chamber": vote.get("chamber"),
+                    "rollCall": vote.get("rollCall"),
+                    "date": vote.get("date"),
+                    "question": vote.get("question"),
+                    "position": vote.get("position"),
+                    "result": vote.get("result"),
+                    "bill": vote.get("bill") if vote.get("bill") else None
+                })
+            
+            response_data = {
+                "bioguide_id": bioguide_id,
+                "votes": results,
+                "count": len(results),
+                "source": format_source("congress", f"Member {bioguide_id} Voting Record")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(response_data, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error fetching member votes: {str(e)}"
+            )]
+    
+    elif name == "get_congress_calendar":
+        try:
+            chamber = arguments.get("chamber", "both")
+            date_from = arguments.get("date_from")
+            date_to = arguments.get("date_to")
+            
+            # Note: Congress.gov API doesn't have a direct calendar endpoint
+            # This would typically integrate with House/Senate calendar systems
+            # For now, return educational information about the calendar
+            
+            calendar_info = {
+                "chamber": chamber,
+                "typical_schedule": {
+                    "house": {
+                        "voting_days": "Tuesday through Thursday",
+                        "first_votes": "6:30 PM Monday, 2:00 PM Tuesday-Wednesday, 9:00 AM Thursday-Friday",
+                        "last_votes": "No later than 3:00 PM Friday"
+                    },
+                    "senate": {
+                        "voting_days": "Monday through Friday",
+                        "typical_hours": "Convenes at 10:00 AM or 2:00 PM",
+                        "voting_windows": "Votes typically occur in afternoon"
+                    }
+                },
+                "recess_periods": [
+                    "Presidents Day (February)",
+                    "Two-week Spring Recess (March/April)",
+                    "Memorial Day (May)",
+                    "Independence Day (July)",
+                    "August Recess (entire month)",
+                    "Labor Day (September)",
+                    "Columbus Day (October)",
+                    "Thanksgiving (November)",
+                    "Christmas/New Year (December/January)"
+                ],
+                "note": "Check house.gov and senate.gov for current calendars",
+                "source": format_source("calculation", "Congressional Calendar Information")
+            }
+            
+            return [types.TextContent(
+                type="text",
+                text=json.dumps(calendar_info, indent=2)
+            )]
+            
+        except Exception as e:
+            return [types.TextContent(
+                type="text",
+                text=f"Error fetching calendar: {str(e)}"
+            )]
     
     else:
         return [types.TextContent(
@@ -650,5 +1352,9 @@ async def get_openapi():
     return app.openapi()
 
 if __name__ == "__main__":
+    # Load default documents on startup
+    print("Loading default Congressional knowledge documents...")
+    load_default_documents()
+    
     # Run with uvicorn
     uvicorn.run(app, host="0.0.0.0", port=PORT)

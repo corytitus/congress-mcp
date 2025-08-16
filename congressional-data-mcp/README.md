@@ -1,25 +1,29 @@
 # Congressional Data MCP Server
 
-A comprehensive Model Context Protocol (MCP) server that provides unified access to both Congress.gov and GovInfo APIs, containerized with Docker for easy self-hosting.
+A comprehensive Model Context Protocol (MCP) server that provides unified access to both Congress.gov and GovInfo APIs. Features multiple server implementations including a stateless authentication system for secure deployments and local development servers for Claude Desktop integration.
 
 ## Features
 
+- **Multiple Server Implementations**: Stateless, enhanced local, and remote cloud-ready servers
+- **Stateless Authentication**: Token-based authentication system for secure deployments
 - **Unified Interface**: Single MCP interface for both Congress.gov and GovInfo data
+- **Document Storage**: SQLite-based document storage for legislative documents and educational content
+- **Related Bills Analysis**: Cross-referencing and relationship mapping between legislative items
 - **Comprehensive Coverage**: Access to bills, members, votes, committees, public laws, Federal Register, CFR, and more
-- **Docker Containerized**: Easy deployment with Docker and docker-compose
-- **Built-in Caching**: Redis-backed caching for improved performance
-- **Rate Limiting**: Configurable rate limits to respect API quotas
-- **Health Monitoring**: Built-in health checks and optional Prometheus metrics
+- **Built-in Caching**: In-memory caching with TTL for improved performance
 - **Async Support**: Fully asynchronous implementation for better performance
 
 ## Prerequisites
 
-- Docker and Docker Compose
+- Python 3.8+ (for local development)
+- Docker and Docker Compose (for containerized deployment)
 - Congress.gov API key ([Sign up here](https://api.congress.gov/sign-up/))
 - GovInfo API key ([Sign up here](https://api.data.gov/signup/))
 - MCP-compatible client (Claude Desktop, Claude Code, or custom implementation)
 
 ## Quick Start
+
+### Option 1: Local Development (Recommended for Claude Desktop)
 
 1. **Clone the repository**:
    ```bash
@@ -27,29 +31,54 @@ A comprehensive Model Context Protocol (MCP) server that provides unified access
    cd congressional-data-mcp
    ```
 
-2. **Configure environment**:
+2. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. **Configure environment**:
+   ```bash
+   export CONGRESS_GOV_API_KEY=your_congress_api_key
+   export GOVINFO_API_KEY=your_govinfo_api_key
+   ```
+
+4. **Configure Claude Desktop**:
+   
+   Add to `~/.claude/claude_desktop_config.json`:
+   ```json
+   {
+     "mcpServers": {
+       "congressional-data": {
+         "command": "/path/to/congressional-data-mcp/run_enactai.sh"
+       }
+     }
+   }
+   ```
+
+### Option 2: Stateless Server (Recommended for Production)
+
+1. **Run the stateless server**:
+   ```bash
+   ./run_stateless.sh
+   ```
+
+2. **Configure with authentication**:
+   ```bash
+   export REQUIRE_AUTH=true
+   # Use token_cli.py to manage authentication tokens
+   ```
+
+### Option 3: Docker Deployment
+
+1. **Configure environment**:
    ```bash
    cp .env.template .env
    # Edit .env and add your API keys
    ```
 
-3. **Build and run with Docker**:
+2. **Build and run with Docker**:
    ```bash
    docker-compose up -d
-   ```
-
-4. **Configure your MCP client**:
-   
-   For Claude Desktop, add to `claude_desktop_config.json`:
-   ```json
-   {
-     "mcpServers": {
-       "congressional-data": {
-         "command": "docker",
-         "args": ["exec", "-i", "congressional-data-mcp", "python", "server.py"]
-       }
-     }
-   }
    ```
 
 ### Alternative Installation Methods
@@ -60,27 +89,67 @@ A comprehensive Model Context Protocol (MCP) server that provides unified access
 
 ## Available Tools
 
-### Congress.gov Tools
+### Core Legislative Tools
 
-- **get_bills**: Search and filter congressional bills
-- **get_bill_details**: Get comprehensive bill information including text, actions, and cosponsors
-- **get_members**: Search for current and historical members of Congress
+- **search_bills**: Search congressional bills with advanced filtering
+- **get_bill**: Get comprehensive information about a specific bill
+- **get_related_bills**: Find bills related to a specific bill (similar bills, procedurally-related bills, etc.)
+- **get_member**: Get detailed information about a member of Congress
 - **get_votes**: Access House and Senate voting records
-- **get_committees**: Get committee information and activities
+- **get_committee**: Get information about congressional committees
 
-### GovInfo Tools
+### Document Management Tools
 
-- **govinfo_search**: Full-text search across GovInfo collections
-- **govinfo_get_package**: Retrieve detailed package information with content
-- **govinfo_get_collection**: List packages in specific collections
-- **govinfo_get_related**: Find related documents
-- **get_public_laws**: Access enacted public laws
-- **get_federal_register**: Search Federal Register documents
-- **get_cfr**: Access Code of Federal Regulations
+- **store_document**: Store legislative documents and educational content
+- **search_documents**: Search stored documents by content, title, or tags
+- **get_document**: Retrieve a specific stored document
+- **list_documents**: List all stored documents with metadata
 
-### Combined Tools
+### Authentication Tools (Stateless Server)
 
-- **track_legislation**: Track a bill from introduction through enactment
+- **authenticate**: Validate API tokens for secure access
+
+### Educational Tools
+
+- **learn_congress**: Interactive lessons about how Congress works
+- **explain_bill_process**: Learn about the legislative process
+- **get_civics_info**: Access civics education resources
+
+## Authentication Guide
+
+### For Stateless Server (Production)
+
+The stateless server supports token-based authentication for secure deployments:
+
+1. **Enable authentication**:
+   ```bash
+   export REQUIRE_AUTH=true
+   ```
+
+2. **Create tokens**:
+   ```bash
+   python token_cli.py create --name "my-token" --description "Token for production use"
+   ```
+
+3. **Use tokens in API calls**:
+   Include the token in each tool call as a parameter.
+
+4. **Manage tokens**:
+   ```bash
+   python token_cli.py list                # List all tokens
+   python token_cli.py revoke <token_id>   # Revoke a token
+   ```
+
+For detailed authentication setup, see [STATELESS_AUTH_GUIDE.md](STATELESS_AUTH_GUIDE.md).
+
+### For Local Development
+
+Local development servers (enhanced) don't require authentication by default. Simply set your API keys:
+
+```bash
+export CONGRESS_GOV_API_KEY=your_key
+export GOVINFO_API_KEY=your_key
+```
 
 ## Configuration Options
 
@@ -90,10 +159,8 @@ A comprehensive Model Context Protocol (MCP) server that provides unified access
 |----------|-------------|---------|
 | `CONGRESS_GOV_API_KEY` | Congress.gov API key | Required |
 | `GOVINFO_API_KEY` | GovInfo API key | Required |
-| `CACHE_TTL` | Cache time-to-live in seconds | 3600 |
-| `CACHE_SIZE` | Maximum cached items | 1000 |
-| `RATE_LIMIT_CONGRESS` | Congress API requests/minute | 100 |
-| `RATE_LIMIT_GOVINFO` | GovInfo API requests/minute | 100 |
+| `REQUIRE_AUTH` | Enable token authentication (stateless server) | true |
+| `CACHE_TTL` | Cache time-to-live in seconds | 300 |
 
 ### Docker Compose Services
 

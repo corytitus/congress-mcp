@@ -15,6 +15,7 @@ from mcp.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
 import mcp.server.stdio
 import mcp.types as types
+from document_store import DocumentStore
 
 # Get API keys from environment
 CONGRESS_API_KEY = os.getenv("CONGRESS_GOV_API_KEY", "")
@@ -29,6 +30,9 @@ client = httpx.AsyncClient(
     limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
     follow_redirects=True
 )
+
+# Document storage
+doc_store = DocumentStore()
 
 # Simple in-memory cache
 cache = {}
@@ -188,6 +192,20 @@ async def handle_list_tools() -> list[types.Tool]:
                 }
             }
         ),
+        types.Tool(
+            name="get_related_bills",
+            description="Get bills related to a specific bill (similar bills, procedurally-related bills, etc.)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "congress": {"type": "integer", "description": "Congress number (e.g., 118 for 2023-2024)"},
+                    "bill_type": {"type": "string", "description": "Bill type (hr, s, hjres, sjres, hres, sres, hconres, sconres)"},
+                    "bill_number": {"type": "integer", "description": "Bill number"},
+                    "limit": {"type": "integer", "description": "Maximum number of related bills to return", "default": 20}
+                },
+                "required": ["congress", "bill_type", "bill_number"]
+            }
+        ),
         
         # GovInfo Tools
         types.Tool(
@@ -268,6 +286,59 @@ async def handle_list_tools() -> list[types.Tool]:
                 "properties": {
                     "chamber": {"type": "string", "description": "Chamber (house, senate, both)", "default": "both"},
                     "days_ahead": {"type": "integer", "description": "Number of days to look ahead", "default": 30}
+                }
+            }
+        ),
+        
+        # Document Storage Tools
+        types.Tool(
+            name="store_document",
+            description="Store a document (text, PDF, or other content) in the document storage system",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Original filename"},
+                    "content": {"type": "string", "description": "Document content (text or base64 encoded)"},
+                    "title": {"type": "string", "description": "Document title"},
+                    "description": {"type": "string", "description": "Document description"},
+                    "tags": {"type": "string", "description": "Comma-separated tags"},
+                    "category": {"type": "string", "description": "Document category"}
+                },
+                "required": ["filename", "content"]
+            }
+        ),
+        types.Tool(
+            name="search_documents",
+            description="Search stored documents by title, content, tags, or other metadata",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "category": {"type": "string", "description": "Filter by category"},
+                    "tags": {"type": "string", "description": "Filter by tags (comma-separated)"},
+                    "limit": {"type": "integer", "description": "Maximum results to return", "default": 10}
+                }
+            }
+        ),
+        types.Tool(
+            name="get_document",
+            description="Retrieve a specific stored document by ID",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "document_id": {"type": "string", "description": "Document ID"}
+                },
+                "required": ["document_id"]
+            }
+        ),
+        types.Tool(
+            name="list_documents",
+            description="List all stored documents with metadata",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string", "description": "Filter by category"},
+                    "limit": {"type": "integer", "description": "Maximum results to return", "default": 20}
                 }
             }
         )
@@ -415,6 +486,56 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
                     for bill in bills
                 ],
                 "source": format_source("congress", url.replace("https://api.congress.gov", ""))
+            }
+        
+        # Get related bills
+        elif name == "get_related_bills":
+            congress = arguments["congress"]
+            bill_type = arguments["bill_type"]
+            bill_number = arguments["bill_number"]
+            limit = arguments.get("limit", 20)
+            
+            url = f"https://api.congress.gov/v3/bill/{congress}/{bill_type}/{bill_number}/relatedbills"
+            headers = {"X-Api-Key": CONGRESS_API_KEY}
+            params = {"format": "json", "limit": limit}
+            
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            data = response.json()
+            related_bills = data.get("relatedBills", [])
+            
+            # Format the related bills for better readability
+            formatted_bills = []
+            for bill in related_bills:
+                formatted_bill = {
+                    "congress": bill.get("congress"),
+                    "type": bill.get("type"),
+                    "number": bill.get("number"),
+                    "title": bill.get("title"),
+                    "latestAction": bill.get("latestAction", {}),
+                    "relationships": []
+                }
+                
+                # Extract relationship details
+                for relationship in bill.get("relationshipDetails", []):
+                    formatted_bill["relationships"].append({
+                        "type": relationship.get("type"),
+                        "identifiedBy": relationship.get("identifiedBy")
+                    })
+                
+                formatted_bills.append(formatted_bill)
+            
+            result = {
+                "originalBill": {
+                    "congress": congress,
+                    "type": bill_type.upper(),
+                    "number": bill_number,
+                    "identifier": f"{bill_type.upper()} {bill_number} ({congress}th Congress)"
+                },
+                "relatedBills": formatted_bills,
+                "count": data.get("pagination", {}).get("count", len(related_bills)),
+                "source": format_source("congress", f"Related bills for {bill_type.upper()} {bill_number} ({congress}th Congress)")
             }
         
         # Get member with enhanced details
@@ -881,6 +1002,119 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
                 "total_votes": len(votes),
                 "votes": votes[:limit],
                 "source": format_source("congress", "/v3/vote")
+            }
+        
+        # Document Storage Tools
+        elif name == "store_document":
+            filename = arguments["filename"]
+            content = arguments["content"]
+            title = arguments.get("title", filename)
+            description = arguments.get("description", "")
+            tags = arguments.get("tags", "")
+            category = arguments.get("category", "general")
+            
+            # Store the document
+            doc_id = doc_store.store_document(
+                filename=filename,
+                content=content,
+                title=title,
+                description=description,
+                tags=tags.split(",") if tags else [],
+                category=category
+            )
+            
+            result = {
+                "document_id": doc_id,
+                "filename": filename,
+                "title": title,
+                "status": "stored successfully",
+                "source": "Document Storage System"
+            }
+        
+        elif name == "search_documents":
+            query = arguments.get("query", "")
+            category = arguments.get("category")
+            tags = arguments.get("tags", "").split(",") if arguments.get("tags") else None
+            limit = arguments.get("limit", 10)
+            
+            # Search documents
+            documents = doc_store.search_documents(
+                query=query,
+                category=category,
+                tags=tags,
+                limit=limit
+            )
+            
+            result = {
+                "query": query,
+                "filters": {
+                    "category": category,
+                    "tags": tags
+                },
+                "results_count": len(documents),
+                "documents": [
+                    {
+                        "id": doc["id"],
+                        "title": doc["title"],
+                        "filename": doc["filename"],
+                        "description": doc["description"],
+                        "category": doc["category"],
+                        "tags": doc["tags"],
+                        "uploaded_at": doc["uploaded_at"]
+                    }
+                    for doc in documents
+                ],
+                "source": "Document Storage System"
+            }
+        
+        elif name == "get_document":
+            document_id = arguments["document_id"]
+            
+            # Get the document
+            document = doc_store.get_document(document_id)
+            
+            if document:
+                result = {
+                    "document": {
+                        "id": document["id"],
+                        "title": document["title"],
+                        "filename": document["filename"],
+                        "description": document["description"],
+                        "category": document["category"],
+                        "tags": document["tags"],
+                        "content": document["content"],
+                        "uploaded_at": document["uploaded_at"],
+                        "size": document["size"]
+                    },
+                    "source": "Document Storage System"
+                }
+            else:
+                result = {"error": f"Document '{document_id}' not found"}
+        
+        elif name == "list_documents":
+            category = arguments.get("category")
+            limit = arguments.get("limit", 20)
+            
+            # List documents using search_documents with no query
+            documents = doc_store.search_documents(category=category)[:limit]
+            
+            result = {
+                "filters": {"category": category},
+                "total_count": len(documents),
+                "documents": [
+                    {
+                        "id": doc["id"],
+                        "title": doc["title"],
+                        "filename": doc["filename"],
+                        "description": doc["description"],
+                        "category": doc["category"],
+                        "tags": doc["tags"],
+                        "uploaded_at": doc["uploaded_at"],
+                        "size": doc["size"]
+                    }
+                    for doc in documents
+                ],
+                "source": "Document Storage System"
             }
         
         # Default response for unknown tools

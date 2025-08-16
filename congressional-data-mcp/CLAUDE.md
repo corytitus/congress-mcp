@@ -6,13 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is the **EnactAI Data MCP Server** - a Model Context Protocol (MCP) server that provides authoritative legislative data from Congress.gov and GovInfo.gov APIs. The project supports both local Claude Desktop integration and remote cloud deployment for use with custom connectors across different LLM platforms.
 
+**Last Updated**: January 16, 2025
+**Current Status**: Production-ready with 20+ tools and comprehensive document storage
+
 ## Architecture
 
 ### Core Server Implementations
 
-- **`enactai_server_enhanced.py`** - Primary local MCP server with 14 comprehensive tools, in-memory caching, and stdio transport
+- **`enactai_server_stateless.py`** - Primary MCP server with stateless token-based authentication for secure deployments
+- **`enactai_server_enhanced.py`** - Enhanced local MCP server with comprehensive tools, in-memory caching, and stdio transport
 - **`enactai_server_remote.py`** - Cloud-ready FastAPI server with SSE transport for remote connections
-- **`server.py`** - Legacy comprehensive server with Redis/Prometheus support (original implementation)
 
 ### Key Architectural Patterns
 
@@ -21,14 +24,20 @@ This is the **EnactAI Data MCP Server** - a Model Context Protocol (MCP) server 
 - Tools are registered via `@server.list_tools()` and `@server.call_tool()` decorators
 - Communication via stdio (local) or SSE (remote) transport
 
-**Dual Data Source Integration:**
+**Comprehensive Data Integration:**
 - **Congress.gov API** - Legislative data (bills, members, votes, committees)
 - **GovInfo.gov API** - Official documents (laws, Federal Register, CFR)
+- **Document Storage System** - Local SQLite-based storage for legislative documents and educational content
+- **Related Bills Analysis** - Cross-referencing and relationship mapping between legislative items
 - All responses include proper source citations via `format_source()` function
 
+**Authentication & Security:**
+- Stateless server: Token-based authentication with configurable requirements
+- Enhanced server: Local development without authentication requirements
+- All servers: Environment variable configuration for API keys
+
 **Caching Strategy:**
-- Enhanced server: In-memory cache with TTL (5 minutes default)
-- Legacy server: Optional Redis integration
+- Stateless/Enhanced servers: In-memory cache with TTL (5 minutes default)
 - Cache keys generated via MD5 hash of tool name + arguments
 
 **Error Handling:**
@@ -41,7 +50,10 @@ This is the **EnactAI Data MCP Server** - a Model Context Protocol (MCP) server 
 ### Local Development & Testing
 
 ```bash
-# Run enhanced local server (current production)
+# Run stateless server (primary production server)
+./run_stateless.sh
+
+# Run enhanced local server (for local development)
 ./run_enactai.sh
 
 # Run remote server locally with Docker
